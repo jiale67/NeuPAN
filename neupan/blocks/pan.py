@@ -112,15 +112,15 @@ class PAN(torch.nn.Module):
         """
         input:
             - nom_s: nominal state; (3, receding+1)
-            - nom_u: nominal control; (2, receding)
+            - nom_u: nominal control; (control_dim, receding), control_dim 2 或 3(omni3)
             - ref_states: reference trajectory; (3, receding+1)
             - ref_us: reference speed array;  (receding,)
             - obs_points: (2, number of obs points), point cloud, global coordinate
             - velocities: (2, number of obs points), velocity of each obs point
-            - ref_tangent: unit path tangent; (2, receding). omni only.
+            - ref_tangent: unit path tangent; (2, receding). omni / omni3 only.
 
         output:
-            - opt_vel: optimal velocity tensor; (2, receding)
+            - opt_vel: optimal velocity tensor; (control_dim, receding)
             - opt_state: optimal state array  (3, receding+1)
 
         process:

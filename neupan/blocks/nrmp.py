@@ -125,14 +125,14 @@ class NRMP(torch.nn.Module):
     ):
         """
         nom_s: nominal state, 3 * (T+1)
-        nom_u: nominal speed, 1 * T
+        nom_u: nominal control, control_dim * T (control_dim 2, 或 3 for omni3)
         ref_s: reference state, 3 * (T+1)
         ref_us: reference speed array, (T,),
         mu_list: list of mu matrix, (max_num, )
         lam_list: list of lam matrix, (max_num, 1)
         point_list: list of obstacle points, (max_num, 2)
-        ref_tangent: unit path tangent, (2, T). omni only; 用来把速度分解成
-                     沿路径/垂直路径分量, 见 robot.C0_cost。
+        ref_tangent: unit path tangent, (2, T). omni / omni3 only; 用来把平移速度
+                     分解成沿路径/垂直路径分量, 见 robot.C0_cost。
         """
 
         if point_list:

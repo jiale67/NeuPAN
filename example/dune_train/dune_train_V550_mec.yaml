@@ -10,9 +10,21 @@
 # 否则训出来的权重和运行时的 G/h 不匹配 —— 而且不会报错，只会静默算错碰撞距离。
 
 robot:
-  # DUNE 只用 length/width 算 G/h，kinematics 不参与训练。写 omni 是为了跟
+  # DUNE 只用 length/width 算 G/h，kinematics 不参与训练。写 omni3 是为了跟
   # 运行时配置对齐，避免以后对照时产生疑问。
-  kinematics: 'omni'
+  #
+  # 控制量从 (vx, vy) 改成 (vx, vy, w) **不需要重训 DUNE**: G/h 只由
+  # length/width 决定，与控制量参数化无关。现有的
+  # pretrain_V550_mec/model_5000.pth 继续有效。
+  #
+  # 注意 omni3 要求 max_speed/max_acce 是三元素，但训练路径不走
+  # bound_su_constraints，这里不给这两项也能训（robot.__init__ 的默认值是 inf，
+  # np.c_[[inf, inf]] 只有两行 -> 会触发 omni3 的三元素校验）。所以真要重训时
+  # 要么把 kinematics 写回 'omni'，要么补上三元素的 max_speed/max_acce。
+  # 已经补上了，见下面两行 —— 值无关紧要，训练不用它们。
+  kinematics: 'omni3'
+  max_speed: [1.0, 1.0, 1.0]
+  max_acce: [1.0, 1.0, 2.0]
   length: 0.26
   width: 0.2446
 

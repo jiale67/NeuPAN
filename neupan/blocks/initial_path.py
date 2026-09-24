@@ -123,8 +123,9 @@ class InitialPath:
 
         ref_us = gear_array * ref_speed
 
-        if self.robot.kinematics == "omni":
-            # omni 的控制量是笛卡尔 (vx, vy), 代价函数要把速度分解到路径坐标系,
+        if self.robot.cartesian_vel:
+            # omni/omni3 的控制量前两维是笛卡尔 (vx, vy), 代价函数要把速度分解到
+            # 路径坐标系,
             # 所以额外给出每步的**单位切向** (2, T)。ref_us 仍是标量参考速度,
             # 含义不变 (沿路径方向的速度大小)。
             #
@@ -415,6 +416,13 @@ class InitialPath:
         elif self.robot.kinematics == "omni":
             next_state = self.omni_model(robot_state, vel, sample_time)
 
+        elif self.robot.kinematics == "omni3":
+            next_state = self.omni3_model(robot_state, vel, sample_time)
+
+        else:
+            raise ValueError(
+                "unsupported kinematics: %r" % self.robot.kinematics)
+
         return next_state
 
     def ackermann_model(self, car_state, vel, wheel_base, sample_time):
@@ -458,7 +466,20 @@ class InitialPath:
         omni_vel = np.array([[vel[0, 0]], [vel[1, 0]], [0]])
 
         next_state = robot_state + sample_time * omni_vel
-       
+
+        return next_state
+
+    def omni3_model(self, robot_state, vel, sample_time):
+
+        # vel = (vx, vy, w)。vx/vy 是**世界系**笛卡尔平移速度, w 是角速度,
+        # 与 robot.linear_omni3_model 一致 —— 这里是那个线性模型的直接积分,
+        # 所以两者**必须**保持一致, 否则 nom_s 和凸问题里的动力学约束会错位。
+        assert robot_state.shape[0] >= 3 and vel.shape == (3, 1)
+
+        omni_vel = np.array([[vel[0, 0]], [vel[1, 0]], [vel[2, 0]]])
+
+        next_state = robot_state + sample_time * omni_vel
+
         return next_state
 
     @property

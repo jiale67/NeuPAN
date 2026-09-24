@@ -60,8 +60,37 @@ class robot:
         self.L = wheelbase
 
         self.kinematics = kinematics
+
+        # ---- 控制量的维度与语义 ----------------------------------------------
+        #   diff  : u = (v, w)          车体系前向速度 + 角速度
+        #   acker : u = (v, psi)        车体系前向速度 + 前轮转角
+        #   omni  : u = (vx, vy)        **世界系**笛卡尔速度, theta 不可控
+        #   omni3 : u = (vx, vy, w)     **世界系**笛卡尔速度 + 角速度
+        #
+        # omni3 是给麦轮/全向底盘用的完整 3 自由度版本。omni 保持原样不动,
+        # 已有的 omni 配置 (NeuPAN 自带 example、limo_omni) 行为不变。
+        #
+        # cartesian_vel: 控制量前两维是世界系笛卡尔速度, 需要把速度分解到路径
+        #                坐标系才能和标量 ref_speed 比较 (见 C0_cost)。
+        # yaw_controllable: theta 在动力学里可控, 于是它该进状态代价。omni 的
+        #                   B 第三行恒为 [0, 0], theta 怎么罚都没用, 所以排除。
+        self.cartesian_vel = kinematics in ('omni', 'omni3')
+        self.control_dim = 3 if kinematics == 'omni3' else 2
+        self.yaw_controllable = kinematics != 'omni'
+
         self.max_speed = np.c_[max_speed] if isinstance(max_speed, list) else max_speed
         self.max_acce = np.c_[max_acce] if isinstance(max_acce, list) else max_acce
+
+        if kinematics == 'omni3':
+            # omni3 的第三维是角速度, 与平移各用一套界 (见 bound_su_constraints)。
+            # 不给默认值而是直接报错: 角速度上限是个物理量, 猜一个数会让车在
+            # 仿真里表现得莫名其妙, 不如让配置写清楚。
+            if self.max_speed.shape[0] < 3 or self.max_acce.shape[0] < 3:
+                raise ValueError(
+                    "omni3 kinematics requires 3-element max_speed / max_acce: "
+                    "[v_norm, (unused), w]. got max_speed="
+                    f"{self.max_speed.flatten().tolist()}, "
+                    f"max_acce={self.max_acce.flatten().tolist()}")
 
         if kinematics == 'acker':
             if self.max_speed[1] >= 1.57:
@@ -97,9 +126,9 @@ class robot:
         """
 
         self.indep_s = cp.Variable((3, self.T + 1), name="state")  # t0 - T
-        self.indep_u = cp.Variable((2, self.T), name="vel")  # t1 - T
+        self.indep_u = cp.Variable((self.control_dim, self.T), name="vel")  # t1 - T
 
-        if self.kinematics == 'omni':
+        if self.cartesian_vel:
             # 速度沿路径方向的投影。本来可以直接写
             #   para_p_u * sum(para_gamma_tangent * indep_u)
             # 但那是 参数 x 参数 x 变量, 不满足 DPP, CvxpyLayer 会拒绝。
@@ -134,18 +163,19 @@ class robot:
 
         self.para_gamma_b = cp.Parameter((self.T,), name='para_gamma_b')
 
-        if self.kinematics == 'omni':
-            # omni 额外需要路径切向 (单位矢量), 用来把速度分解成沿路径/垂直路径
-            # 两个分量。只惩罚沿路径分量, 垂直分量留给避障 (见 C0_cost 的说明)。
+        if self.cartesian_vel:
+            # 笛卡尔速度 (omni/omni3) 额外需要路径切向 (单位矢量), 用来把速度分解成
+            # 沿路径/垂直路径两个分量。只惩罚沿路径分量, 垂直分量留给避障
+            # (见 C0_cost 的说明)。
             self.para_gamma_tangent = cp.Parameter((2, self.T), name='para_gamma_tangent')
 
         self.para_A_list = [ cp.Parameter((3, 3), name='para_A_'+str(t)) for t in range(self.T)]
-        self.para_B_list = [ cp.Parameter((3, 2), name='para_B_'+str(t)) for t in range(self.T)]
+        self.para_B_list = [ cp.Parameter((3, self.control_dim), name='para_B_'+str(t)) for t in range(self.T)]
         self.para_C_list = [ cp.Parameter((3, 1), name='para_C_'+str(t)) for t in range(self.T)]
 
         para_list = [self.para_s, self.para_gamma_a, self.para_gamma_b]
 
-        if self.kinematics == 'omni':
+        if self.cartesian_vel:
             para_list += [self.para_gamma_tangent]
 
         return para_list + self.para_A_list + self.para_B_list + self.para_C_list
@@ -191,8 +221,9 @@ class robot:
         para_q_s: weight of state cost (scalar or 3-element vector for x, y, theta)
         '''
 
-        if self.kinematics == 'omni':
-            # 笛卡尔控制量 u = (vx, vy)。把速度**分解**到路径坐标系:
+        if self.cartesian_vel:
+            # 笛卡尔控制量 u = (vx, vy) 或 (vx, vy, w)。把**平移**速度分解到
+            # 路径坐标系:
             #
             #   沿路径分量 u_along = tangent . u    -> 惩罚它偏离 ref_speed
             #   垂直路径分量 u_perp = normal . u    -> 按 lateral_ratio 打折惩罚
@@ -225,6 +256,11 @@ class robot:
             if self.lateral_ratio > 0.0:
                 diff_u = cp.hstack(
                     [diff_u, (self.lateral_ratio * para_p_u) * self.indep_u_perp])
+
+            # omni3 的第三维 w **不进速度代价**, 与 diff 的 u[1] 一致。理由:
+            # theta 现在是可控状态 (B 第三行 [0,0,dt]), 它的偏差已经被下面的
+            # diff_s 第三行罚了 —— 那才是"车头该朝哪"的正确表述。再罚 w 本身
+            # 等于罚"转动", 会让车不愿意转向, 属于重复且方向错误的惩罚。
         else:
             # diff/acker: u[0] 是标量前向速度, u[1] 是角速度/前轮转角, 不惩罚。
             diff_u = para_p_u * self.indep_u[0, :] - self.para_gamma_b
@@ -239,9 +275,15 @@ class robot:
             # Scalar multiplication (backward compatibility)
             diff_s = para_q_s * self.indep_s - self.para_gamma_a
 
-        if self.kinematics == 'omni':
+        if not self.yaw_controllable:
+            # omni: B 第三行恒为 [0, 0], theta 在优化里不可达, 罚它只会往目标函数
+            # 里加一个与决策变量无关的常数 (还会让 proximal 项失衡), 所以只算 x,y。
             diff_s_cost = cp.sum_squares(diff_s[0:2])
         else:
+            # diff/acker/omni3: theta 可控, 全部三行都进代价。omni3 下这一项就是
+            # 车头朝向的控制律 —— 参考路径的 theta 是行进方向(见
+            # initial_path._ensure_consistent_angles), 所以车头会自然对准路径方向,
+            # 不再需要 neupan_core 那个外挂的 omni_yaw 补偿环。
             diff_s_cost = cp.sum_squares(diff_s)
 
         C0_cost = diff_s_cost + cp.sum_squares(diff_u)
@@ -308,32 +350,45 @@ class robot:
 
         constraints = []
 
-        if self.kinematics == 'omni':
+        if self.cartesian_vel:
             # 笛卡尔 (vx, vy) 下用二阶锥限幅而不是箱式限幅: cp.abs(u) <= bound
             # 是个方形包络, 对角方向会放行 sqrt(2)*max_speed。norm 限的是真实
             # 对地速度/加速度大小, 各向同性, 也才是麦轮该有的物理含义。
-            # max_speed[0] / max_acce[0] 是速度和加速度的**模长**上限,
-            # 第二项对 omni 不再使用。
-            constraints += [ cp.norm(self.indep_u[:, 1:] - self.indep_u[:, :-1], axis=0)
+            # max_speed[0] / max_acce[0] 是**平移**速度和加速度的模长上限。
+            uv = self.indep_u[0:2, :]     # 平移分量, omni 就是全部, omni3 是前两行
+
+            constraints += [ cp.norm(uv[:, 1:] - uv[:, :-1], axis=0)
                              <= float(self.acce_bound[0, 0]) ]
-            constraints += [ cp.norm(self.indep_u, axis=0) <= float(self.speed_bound[0, 0]) ]
+            constraints += [ cp.norm(uv, axis=0) <= float(self.speed_bound[0, 0]) ]
+
+            if self.control_dim == 3:
+                # w 与平移是**独立**的自由度, 不能塞进同一个锥里: 那会让
+                # "转得快" 挤占 "走得快" 的预算, 而麦轮底盘上二者由不同的轮速
+                # 组合实现, 物理上并不共享一个模长预算。所以单独箱式限幅,
+                # 界取 max_speed[2] / max_acce[2] (对 omni3 必须给三个元素)。
+                w = self.indep_u[2:3, :]
+                constraints += [ cp.abs(w[:, 1:] - w[:, :-1])
+                                 <= float(self.acce_bound[2, 0]) ]
+                constraints += [ cp.abs(w) <= float(self.speed_bound[2, 0]) ]
         else:
             constraints += [ cp.abs(self.indep_u[:, 1:] - self.indep_u[:, :-1] ) <= self.acce_bound ]
             constraints += [ cp.abs(self.indep_u) <= self.speed_bound]
 
         constraints += [ self.indep_s[:, 0:1] == self.para_s[:, 0:1] ]
 
-        if self.kinematics == 'omni':
+        if self.cartesian_vel:
             # 定义沿路径/垂直路径两个分量。都是参数仿射, DPP 安全。
             #   tangent = (tx, ty)          -> along = tx*vx + ty*vy
             #   normal  = (-ty, tx)         -> perp  = -ty*vx + tx*vy
+            # 只取前两行(平移), omni3 的 w 不参与投影。
             tang = self.para_gamma_tangent
             normal = cp.vstack([-tang[1, :], tang[0, :]])
+            uv = self.indep_u[0:2, :]
 
             constraints += [ self.indep_u_along
-                             == cp.sum(cp.multiply(tang, self.indep_u), axis=0) ]
+                             == cp.sum(cp.multiply(tang, uv), axis=0) ]
             constraints += [ self.indep_u_perp
-                             == cp.sum(cp.multiply(normal, self.indep_u), axis=0) ]
+                             == cp.sum(cp.multiply(normal, uv), axis=0) ]
 
         return constraints
     
@@ -342,16 +397,17 @@ class robot:
                                        ref_tangent=None):
 
         '''
-        ref_tangent: 仅 omni 需要, 单位路径切向 (2, T), 不含 p_u。
+        ref_tangent: 仅 omni/omni3 需要, 单位路径切向 (2, T), 不含 p_u。
                      顺序必须与 state_parameter_define 返回的列表一致。
         '''
 
         state_value_list = [nom_s, qs_ref_s, pu_ref_us]
 
-        if self.kinematics == 'omni':
+        if self.cartesian_vel:
             if ref_tangent is None:
                 raise ValueError(
-                    "omni kinematics requires ref_tangent (unit path tangent)")
+                    f"{self.kinematics} kinematics requires ref_tangent "
+                    "(unit path tangent)")
             state_value_list = state_value_list + [ref_tangent]
 
         tensor_A_list = []
@@ -368,8 +424,11 @@ class robot:
                 A, B, C = self.linear_diff_model(nom_st, nom_ut, self.dt)
             elif self.kinematics == 'omni':
                 A, B, C = self.linear_omni_model(nom_ut, self.dt)
+            elif self.kinematics == 'omni3':
+                A, B, C = self.linear_omni3_model(nom_ut, self.dt)
             else:
-                raise ValueError('kinematics currently only supports acker or diff')
+                raise ValueError(
+                    'kinematics currently only supports acker, diff, omni, omni3')
 
             tensor_A_list.append(A)
             tensor_B_list.append(B)
@@ -441,6 +500,40 @@ class robot:
 
         A = torch.Tensor([ [1, 0, 0], [0, 1, 0], [0, 0, 1] ])
         B = torch.Tensor([ [ dt, 0 ], [ 0, dt ], [ 0, 0 ] ])
+        C = torch.zeros((3, 1))
+
+        return to_device(A), to_device(B), to_device(C)
+
+    def linear_omni3_model(self, nom_u, dt):
+
+        '''
+        全向底盘的完整 3 自由度模型。控制量 u = (vx, vy, w):
+        vx/vy 是**世界系**笛卡尔平移速度, w 是角速度。
+
+            x_{t+1}     = x_t + vx_t * dt
+            y_{t+1}     = y_t + vy_t * dt
+            theta_{t+1} = theta_t + w_t * dt
+
+        与 omni 的唯一差别是 B 第三行从 [0, 0] 变成 [0, 0, dt], 也就是把 theta
+        从"不可控的旁观者"变成真正的状态。这样做的代价是零:
+
+        - **仍然精确线性**。A/B/C 都是常数, 不依赖展开点 nom_u, SCP 外层迭代
+          不引入任何线性化误差。这一点和 omni 一样, 也是选世界系笛卡尔而不是
+          车体系 (vx_body, vy_body, w) 的原因 —— 后者 B 依赖 cos/sin(theta),
+          要线性化, 就会重新引入 CARTESIAN_OMNI.md 第 1 节说的那类病态。
+        - theta 有初值锚 (bound_su_constraints 里 indep_s[:,0:1] == para_s[:,0:1]),
+          第 0 步线性化误差为 0, 和 diff 免疫抖动的机制完全相同。
+        - theta 现在进代价 (C0_cost 的 diff_s 全三行), 所以它是被**跟踪**的量,
+          不像原来极坐标 omni 的 phi 那样完全自由。
+
+        世界系 -> 车体系的转换留给下游 (neupan_core.generate_twist_msg), 因为
+        ROS 的 Twist.linear 是车体系, 而 w 在平面上两系同值, 不需要转。
+
+        nom_u 保留在签名里只为与其它模型调用形式一致, 本模型不使用它。
+        '''
+
+        A = torch.Tensor([ [1, 0, 0], [0, 1, 0], [0, 0, 1] ])
+        B = torch.Tensor([ [ dt, 0, 0 ], [ 0, dt, 0 ], [ 0, 0, dt ] ])
         C = torch.zeros((3, 1))
 
         return to_device(A), to_device(B), to_device(C)

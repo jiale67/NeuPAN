@@ -73,8 +73,11 @@ class neupan(torch.nn.Module):
         self.collision_threshold = kwargs.get("collision_threshold", 0.1)
 
         # initialization
-        self.cur_vel_array = np.zeros((2, self.T))
         self.robot = robot(receding, step_time, **robot_kwargs)
+        # 控制量维度随运动学变化: diff/acker/omni 是 2, omni3 是 3 (vx, vy, w)。
+        # 这个数组是下一帧 SCP 的展开点 (nominal control), 维度必须与
+        # robot.indep_u 一致, 否则 generate_nom_ref_state 里的积分会形状不匹配。
+        self.cur_vel_array = np.zeros((self.robot.control_dim, self.T))
 
         self.ipath = InitialPath(
             receding, step_time, ref_speed, self.robot, **ipath_kwargs
@@ -116,7 +119,7 @@ class neupan(torch.nn.Module):
 
         if self.ipath.check_arrive(state):
             self.info["arrive"] = True
-            return np.zeros((2, 1)), self.info
+            return np.zeros((self.robot.control_dim, 1)), self.info
 
         nom_input_np = self.ipath.generate_nom_ref_state(
             state, self.cur_vel_array, self.ref_speed
@@ -129,7 +132,7 @@ class neupan(torch.nn.Module):
             np_to_tensor(velocities) if velocities is not None else None
         )
 
-        # omni 时 generate_nom_ref_state 多返回一项单位路径切向 (见 initial_path)。
+        # omni/omni3 时 generate_nom_ref_state 多返回一项单位路径切向 (见 initial_path)。
         # 用切片而不是 *nom_input_tensor 展开, 否则多出来的那一项会顶到
         # obs_points 的位置上。
         ref_tangent_tensor = (
@@ -160,18 +163,22 @@ class neupan(torch.nn.Module):
 
         if self.check_stop():
             self.info["stop"] = True
-            return np.zeros((2, 1)), self.info
+            return np.zeros((self.robot.control_dim, 1)), self.info
         else:
             self.info["stop"] = False
 
         action = opt_vel_np[:, 0:1]
 
-        if self.robot.kinematics == 'omni':
-            # omni 的控制量已经是世界系笛卡尔 (vx, vy), 直接下发, 不需要再从
-            # 极坐标 (v, phi) 转回来。原来这里做 cos/sin 转换, 说明极坐标只是
-            # 个中间表示, 两头都是笛卡尔。
+        if self.robot.cartesian_vel:
+            # omni/omni3 的控制量已经是世界系笛卡尔 (vx, vy[, w]), 直接下发,
+            # 不需要再从极坐标 (v, phi) 转回来。原来这里做 cos/sin 转换,
+            # 说明极坐标只是个中间表示, 两头都是笛卡尔。
             self.info['omni_linear_speed'] = float(np.hypot(action[0, 0], action[1, 0]))
             self.info['omni_orientation'] = float(np.arctan2(action[1, 0], action[0, 0]))
+
+            if self.robot.control_dim == 3:
+                # omni3 的角速度是规划器**算出来**的, 不是外挂补偿环给的。
+                self.info['omni_angular_speed'] = float(action[2, 0])
 
         return action, self.info
 
