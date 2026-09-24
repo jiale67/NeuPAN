@@ -59,6 +59,33 @@ class InitialPath:
         self.arrive_index_threshold = kwargs.get("arrive_index_threshold", 1)
         self.arrive_flag = False
 
+        # ---- 朝向参考从哪来 (只对 omni3 有意义) ------------------------------
+        #   'path' -> ref_s 第三行取**全局初始路径**上参考点的方向 (原行为)。
+        #   'plan' -> 取**规划器自己算出的轨迹**的行进方向, 即 /neupan_plan 的切向。
+        #
+        # 为什么需要 'plan': omni3 下 theta 确实是可控状态且进状态代价
+        # (robot.C0_cost 的 diff_s 全三行), 但它跟踪的参考是全局路径的方向。
+        # _ensure_consistent_angles 把路径每个点的 theta 设成"指向下一个**路径**
+        # 点", 于是绕障时车体已经横移出去了, 朝向参考却还在说"对准全局直线",
+        # 偏差约等于 0 -> w 约等于 0 -> 绕障全靠 vx/vy 蟹行。这就是实测现象
+        # (避障过程中 yaw 几乎不变) 的原因, 不是 generate_twist_msg 漏发角速度。
+        #
+        # 'plan' 把参考换成规划器**当前这条轨迹**的行进方向, 车头就跟着绕障轨迹
+        # 一起摆过去。
+        #
+        # 默认保持 'path': 这是 upstream 行为, 其它 example / limo 配置不受影响。
+        self.heading_ref = str(kwargs.get("heading_ref", "path")).strip().lower()
+
+        if self.heading_ref not in ("path", "plan"):
+            raise ValueError(
+                "ipath.heading_ref expects path|plan, got: %r" % self.heading_ref)
+
+        # 'plan' 模式下, 规划速度模长低于这个值就认为方向不可辨识 (atan2 的结果
+        # 基本是噪声), 退回该步的路径方向。终点附近速度自然衰减到 0, 于是朝向
+        # 参考平滑地回到路径方向, 不会在停车时乱转。
+        self.heading_speed_threshold = float(
+            kwargs.get("heading_speed_threshold", 0.02))
+
         self.cg = curve_generator()
         # initial path and gear
         self.initial_path = None
@@ -84,6 +111,9 @@ class InitialPath:
 
         ref_speed_forward = ref_speed * self.dt
 
+        # 'plan' 模式下每步的朝向参考 (世界系 rad), None 表示该步退回路径方向。
+        plan_heading = self.plan_heading_list(cur_vel_array, gear_list)
+
         for t in range(self.T):
             pre_state = self.motion_predict_model(
                 pre_state, cur_vel_array[:, t : t + 1], self.robot.L, self.dt
@@ -98,7 +128,19 @@ class InitialPath:
                     ref_index = len(self.cur_curve) - 1
                     gear_list[t] = 0
 
-                ref_state = self.cur_curve[ref_index][0:3]
+                # astype(float) 同时修掉两个坑, 两个都只在 heading_ref='plan'
+                # 下才会咬人, 所以原来一直是隐性的:
+                #
+                # 1) 必须是**副本**。原来取的是 cur_curve[ref_index][0:3] 的视图,
+                #    而下面要写 ref_state[2, 0] —— 那等于直接改初始路径上那个点。
+                #    原来侥幸无害 (写回的值与原值同余 2pi, 路径方向没变), 但
+                #    'plan' 写进去的是规划轨迹方向, 会把全局路径的朝向逐点覆盖,
+                #    一旦覆盖, 'path' 这条退路也就没了。
+                # 2) 必须是**浮点**。gctl 生成的路径里个别点是整数 dtype (实测
+                #    waypoints=[[0,0,0],[2,2,0],[4,0,0]] 下 idx 1/33/65 是 int64),
+                #    往 int 数组写 0.785 rad 会被静默截断成 0, 表现为朝向参考
+                #    "偶尔不生效"。'path' 下看不出来: 那几个点的 theta 本来就是 0。
+                ref_state = self.cur_curve[ref_index][0:3].astype(float)
 
             else:
                 ref_state, ref_index = self.find_interaction_point(
@@ -108,6 +150,12 @@ class InitialPath:
                 if ref_index > len(self.cur_curve) - 1:
                     gear_list[t] = 0
 
+            if plan_heading[t] is not None:
+                ref_state[2, 0] = plan_heading[t]
+
+            # 参考朝向按**预测状态**解卷绕。代价是二次的, 看不懂 ±pi 等价,
+            # 所以必须把参考挪到离 pre_state 最近的那个同余值上, 否则车会为了
+            # 消掉一个 2pi 的假偏差而绕远路转一圈。
             diff = ref_state[2, 0] - pre_state[2, 0]
             ref_state[2, 0] = pre_state[2, 0] + WrapToPi(diff)
             state_ref_list.append(ref_state)
@@ -144,6 +192,51 @@ class InitialPath:
             return nom_s, nom_u, ref_s, ref_us, unit_tangent
 
         return nom_s, nom_u, ref_s, ref_us
+
+    def plan_heading_list(self, cur_vel_array, gear_list):
+
+        '''
+        heading_ref='plan' 时每步的朝向参考: **规划轨迹的行进方向**。
+
+        参考取自 cur_vel_array —— 上一帧 NRMP 解出的最优速度序列, 也就是这一帧
+        SCP 的展开点 (nom_u), 同时正是 /neupan_plan 那条轨迹对应的速度。omni3 的
+        动力学 x_{t+1} = x_t + v_t*dt 是**精确**的 (linear_omni3_model 的 A=I,
+        B=dt*I, C=0), 所以 atan2(vy_t, vx_t) 与 opt_state 相邻两点之差的方向严格
+        相等, 直接用速度比对位置做有限差分更干净, 也不用担心末端重合点除零。
+
+        只对 omni3 生效:
+          - diff/acker 的 cur_vel_array 是 (v, w) / (v, psi), 前两行**不是**
+            笛卡尔速度, atan2 出来是无意义的数 —— 必须挡住, 否则是静默的错。
+            这两种底盘也不需要: 非完整约束下车头本来就等于行进方向。
+          - omni (2 自由度) 的 theta 结构上不可控 (B 第三行恒 [0,0]),
+            robot.C0_cost 里 diff_s 只算 [0:2], 朝向参考写什么都不起作用。
+
+        返回长度 T 的列表, 元素是 float (该步的朝向参考) 或 None (退回路径方向)。
+        '''
+
+        none_list = [None] * self.T
+
+        if self.heading_ref != "plan":
+            return none_list
+
+        if not (self.robot.cartesian_vel and self.robot.yaw_controllable):
+            return none_list
+
+        headings = []
+
+        for t in range(self.T):
+            vx, vy = cur_vel_array[0, t], cur_vel_array[1, t]
+
+            # 速度太小时方向不可辨识。终点附近 (gear 置 0, ref_us=0) 速度自然
+            # 衰减到 0, 于是朝向参考平滑退回路径方向, 停车时不会原地乱转。
+            # 第一帧 cur_vel_array 是全零, 这里也会整列返回 None, 车按路径方向
+            # 起步 —— 与改动前的行为一致。
+            if np.hypot(vx, vy) < self.heading_speed_threshold:
+                headings.append(None)
+            else:
+                headings.append(float(np.arctan2(vy, vx)))
+
+        return headings
 
     def set_initial_path(self, path):
 
@@ -209,7 +302,10 @@ class InitialPath:
         while True:
 
             if ref_index > len(self.cur_curve) - 2:
-                end_point = self.cur_curve[-1]
+                # .copy() 同 generate_nom_ref_state 里那处: 原来返回的是
+                # cur_curve[-1] 的视图, 调用方要写第三行, 等于改初始路径末点。
+                # heading_ref='plan' 下写进去的是规划轨迹方向, 会真的破坏路径。
+                end_point = self.cur_curve[-1].astype(float)
                 end_point[2] = WrapToPi(end_point[2])
 
                 return end_point[0:3], ref_index
