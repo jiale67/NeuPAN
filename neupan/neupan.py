@@ -129,8 +129,16 @@ class neupan(torch.nn.Module):
             np_to_tensor(velocities) if velocities is not None else None
         )
 
+        # omni 时 generate_nom_ref_state 多返回一项单位路径切向 (见 initial_path)。
+        # 用切片而不是 *nom_input_tensor 展开, 否则多出来的那一项会顶到
+        # obs_points 的位置上。
+        ref_tangent_tensor = (
+            nom_input_tensor[4] if len(nom_input_tensor) > 4 else None
+        )
+
         opt_state_tensor, opt_vel_tensor, opt_distance_tensor = self.pan(
-            *nom_input_tensor, obstacle_points_tensor, point_velocities_tensor
+            *nom_input_tensor[:4], obstacle_points_tensor, point_velocities_tensor,
+            ref_tangent_tensor
         )
 
         opt_state_np, opt_vel_np = tensor_to_np(opt_state_tensor), tensor_to_np(
@@ -159,13 +167,11 @@ class neupan(torch.nn.Module):
         action = opt_vel_np[:, 0:1]
 
         if self.robot.kinematics == 'omni':
-            vel = opt_vel_np[:, 0:1]
-            vx = vel[0, 0] * cos(vel[1, 0])
-            vy = vel[0, 0] * sin(vel[1, 0])
-            action = np.array([[vx], [vy]])
-
-            self.info['omni_linear_speed'] = vel[0, 0]
-            self.info['omni_orientation'] = vel[1, 0]
+            # omni 的控制量已经是世界系笛卡尔 (vx, vy), 直接下发, 不需要再从
+            # 极坐标 (v, phi) 转回来。原来这里做 cos/sin 转换, 说明极坐标只是
+            # 个中间表示, 两头都是笛卡尔。
+            self.info['omni_linear_speed'] = float(np.hypot(action[0, 0], action[1, 0]))
+            self.info['omni_orientation'] = float(np.arctan2(action[1, 0], action[0, 0]))
 
         return action, self.info
 

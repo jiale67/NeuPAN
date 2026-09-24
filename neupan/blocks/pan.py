@@ -107,16 +107,17 @@ class PAN(torch.nn.Module):
         self.printed = False
 
     def forward(
-        self, nom_s: torch.Tensor, nom_u: torch.Tensor, ref_s: torch.Tensor, ref_us: torch.Tensor, obs_points: torch.Tensor = None, point_velocities: torch.Tensor = None
+        self, nom_s: torch.Tensor, nom_u: torch.Tensor, ref_s: torch.Tensor, ref_us: torch.Tensor, obs_points: torch.Tensor = None, point_velocities: torch.Tensor = None, ref_tangent: torch.Tensor = None
     ):
         """
         input:
-            - nom_s: nominal state; (3, receding+1) 
+            - nom_s: nominal state; (3, receding+1)
             - nom_u: nominal control; (2, receding)
             - ref_states: reference trajectory; (3, receding+1)
             - ref_us: reference speed array;  (receding,)
             - obs_points: (2, number of obs points), point cloud, global coordinate
             - velocities: (2, number of obs points), velocity of each obs point
+            - ref_tangent: unit path tangent; (2, receding). omni only.
 
         output:
             - opt_vel: optimal velocity tensor; (2, receding)
@@ -138,7 +139,8 @@ class PAN(torch.nn.Module):
                 mu_list, lam_list, sort_point_list = [], [], []
                 
             nom_s, nom_u, nom_distance = self.nrmp_layer(
-                nom_s, nom_u, ref_s, ref_us, mu_list, lam_list, sort_point_list
+                nom_s, nom_u, ref_s, ref_us, mu_list, lam_list, sort_point_list,
+                ref_tangent
             )
 
             if self.stop_criteria(nom_s, nom_u, mu_list, lam_list):

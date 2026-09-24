@@ -1,0 +1,33 @@
+# wheeltec V550_mec 的 DUNE 训练配置。
+#
+# 跑法（在本目录下）:
+#   cd /home/rjl/nav_ws/src/NeuPAN/example/dune_train
+#   python3 dune_train_V550_mec.py
+# 产物落在 example/model/ 下，训完把 .pth 路径填到 neupan_ros 那边的
+# ~dune_checkpoint 参数。
+#
+# robot 段必须与 neupan_planner_V550_mec.yaml 的 robot 段**逐字一致**，
+# 否则训出来的权重和运行时的 G/h 不匹配 —— 而且不会报错，只会静默算错碰撞距离。
+
+robot:
+  # DUNE 只用 length/width 算 G/h，kinematics 不参与训练。写 omni 是为了跟
+  # 运行时配置对齐，避免以后对照时产生疑问。
+  kinematics: 'omni'
+  length: 0.26
+  width: 0.2446
+
+train:
+  direct_train: true
+  data_size: 100000
+  # limo/示例默认 [-25,-25,25,25]，那是给 1.6x2.0 那种大车的。V550 只有 0.26m，
+  # 采样范围按车尺寸等比缩小到 ±4m，让样本集中在真正会用到的距离区间，
+  # 否则绝大多数样本都是"离得很远"，近距离精度上不去。
+  # ±4m 也覆盖了运行时 ~scan_range 的上限 8m 的一半，足够 MPC 的 5 步预测视野。
+  data_range: [-4, -4, 4, 4]
+  batch_size: 256
+  epoch: 5000
+  valid_freq: 250
+  save_freq: 500
+  lr: 5e-5
+  lr_decay: 0.5
+  decay_freq: 1500

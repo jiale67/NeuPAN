@@ -121,6 +121,7 @@ class NRMP(torch.nn.Module):
         mu_list: Optional[List[torch.Tensor]] = None,
         lam_list: Optional[List[torch.Tensor]] = None,
         point_list: Optional[List[torch.Tensor]] = None,
+        ref_tangent: Optional[torch.Tensor] = None,
     ):
         """
         nom_s: nominal state, 3 * (T+1)
@@ -130,6 +131,8 @@ class NRMP(torch.nn.Module):
         mu_list: list of mu matrix, (max_num, )
         lam_list: list of lam matrix, (max_num, 1)
         point_list: list of obstacle points, (max_num, 2)
+        ref_tangent: unit path tangent, (2, T). omni only; 用来把速度分解成
+                     沿路径/垂直路径分量, 见 robot.C0_cost。
         """
 
         if point_list:
@@ -138,7 +141,7 @@ class NRMP(torch.nn.Module):
             ]  # current obstacle points considered in the optimization
 
         parameter_values = self.generate_parameter_value(
-            nom_s, nom_u, ref_s, ref_us, mu_list, lam_list, point_list
+            nom_s, nom_u, ref_s, ref_us, mu_list, lam_list, point_list, ref_tangent
         )
 
         solutions = self.nrmp_layer(*parameter_values, solver_args={"solve_method": self.solver}) # see cvxpylayers and cvxpy for more details
@@ -150,13 +153,16 @@ class NRMP(torch.nn.Module):
         return opt_solution_state, opt_solution_vel, nom_d
 
     def generate_parameter_value(
-        self, nom_s, nom_u, ref_s, ref_us, mu_list, lam_list, point_list
+        self, nom_s, nom_u, ref_s, ref_us, mu_list, lam_list, point_list,
+        ref_tangent=None
     ):
-        
+
         adjust_value_list = self.generate_adjust_parameter_value()
 
+        # 切向按**单位矢量**传入, 不预乘 p_u: p_u 在 cost 里作用于辅助变量
+        # indep_u_along, 见 robot.define_variable / C0_cost。
         state_value_list = self.robot.generate_state_parameter_value(
-            nom_s, nom_u, self.q_s * ref_s, self.p_u * ref_us
+            nom_s, nom_u, self.q_s * ref_s, self.p_u * ref_us, ref_tangent
         )
 
         coefficient_value_list = self.generate_coefficient_parameter_value(

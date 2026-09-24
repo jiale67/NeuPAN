@@ -123,6 +123,25 @@ class InitialPath:
 
         ref_us = gear_array * ref_speed
 
+        if self.robot.kinematics == "omni":
+            # omni 的控制量是笛卡尔 (vx, vy), 代价函数要把速度分解到路径坐标系,
+            # 所以额外给出每步的**单位切向** (2, T)。ref_us 仍是标量参考速度,
+            # 含义不变 (沿路径方向的速度大小)。
+            #
+            # 切向用参考点的有限差分, 而不是 ref_s 第三行的 theta —— 对全向底盘
+            # theta 是车头朝向, 跟运动方向无关, 而且上面刚被 WrapToPi 改写过。
+            ref_xy = ref_s[0:2, :]                      # (2, T+1)
+            tangent = ref_xy[:, 1:] - ref_xy[:, :-1]    # (2, T)
+            norm = np.linalg.norm(tangent, axis=0, keepdims=True)
+            # 路径末端相邻参考点重合 -> 切向为零。此时 gear 也已置 0, ref_us 是 0,
+            # 沿路径分量的目标就是 0, 与"到点停住"一致。切向填成 (1,0) 只是避免
+            # 除零, 乘上 ref_us=0 后不影响结果。
+            degenerate = norm < 1e-9
+            safe = np.where(degenerate, 1.0, norm)
+            unit_tangent = tangent / safe
+            unit_tangent[:, degenerate[0]] = np.array([[1.0], [0.0]])
+            return nom_s, nom_u, ref_s, ref_us, unit_tangent
+
         return nom_s, nom_u, ref_s, ref_us
 
     def set_initial_path(self, path):
@@ -433,11 +452,10 @@ class InitialPath:
     
     def omni_model(self, robot_state, vel, sample_time):
 
+        # vel 是**世界系**笛卡尔速度 (vx, vy), 与 robot.linear_omni_model 一致。
         assert robot_state.shape[0] >= 2 and vel.shape == (2, 1)
 
-        vx = vel[0, 0] * cos(vel[1, 0])
-        vy = vel[0, 0] * sin(vel[1, 0])
-        omni_vel = np.array([[vx], [vy], [0]])
+        omni_vel = np.array([[vel[0, 0]], [vel[1, 0]], [0]])
 
         next_state = robot_state + sample_time * omni_vel
        
