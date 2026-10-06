@@ -100,6 +100,30 @@ class robot:
         self.speed_bound = self.max_speed
         self.acce_bound = self.max_acce * self.dt
 
+        # ---- 首步限速 (first-step rate limit) --------------------------------
+        # acce_bound 只约束 horizon **内部**相邻两步 (u_{t+1}-u_t)，第一步 u_0
+        # 与上一控制周期**实际下发**的指令没有任何关系。节点每个控制周期
+        # (ctrl_period, 远小于 step_time) 只执行 u_0，于是执行出来的加速度可以
+        # 远超 max_acce。打开后增加参数 para_u_prev (= 上一拍执行的控制量,
+        # 规划器控制坐标系; omni3 即世界系 vx, vy, w) 和约束
+        #   ||u_0[0:2] - u_prev[0:2]|| <= max_acce[0] * ctrl_period
+        #   |u_0[2]   - u_prev[2]|     <= max_acce[2] * ctrl_period   (omni3)
+        # 默认关闭: 不加参数也不加约束, 与原来逐字节一致。
+        self.first_step_rate_limit = bool(kwargs.get("first_step_rate_limit", False))
+        self.ctrl_period = kwargs.get("ctrl_period", None)
+
+        if self.first_step_rate_limit:
+            if not self.cartesian_vel:
+                raise ValueError(
+                    "first_step_rate_limit is only implemented for omni / omni3 "
+                    f"kinematics, got {kinematics}")
+            if self.ctrl_period is None or float(self.ctrl_period) <= 0.0:
+                raise ValueError(
+                    "first_step_rate_limit requires ctrl_period > 0 (seconds, the "
+                    f"executed command period), got {self.ctrl_period}")
+            self.ctrl_period = float(self.ctrl_period)
+            self.first_step_bound = self.max_acce * self.ctrl_period
+
         # omni 专用: 垂直于路径方向的速度分量, 代价权重相对 p_u 的**比例**
         # (见 C0_cost)。用比例而不是绝对值, 因为起作用的是二者之比 ——
         # 同一个绝对值在 p_u=2.5 和 p_u=1.0 下含义完全不同。
@@ -178,7 +202,15 @@ class robot:
         if self.cartesian_vel:
             para_list += [self.para_gamma_tangent]
 
-        return para_list + self.para_A_list + self.para_B_list + self.para_C_list
+        para_list = para_list + self.para_A_list + self.para_B_list + self.para_C_list
+
+        if self.first_step_rate_limit:
+            # 上一拍实际执行的控制量。放在 state 参数段**末尾**,
+            # generate_state_parameter_value 按同样的顺序在末尾追加取值。
+            self.para_u_prev = cp.Parameter((self.control_dim, 1), name='para_u_prev')
+            para_list = para_list + [self.para_u_prev]
+
+        return para_list
 
 
     def coefficient_parameter_define(self, no_obs: bool = False, max_num: int = 10):
@@ -370,6 +402,17 @@ class robot:
                 constraints += [ cp.abs(w[:, 1:] - w[:, :-1])
                                  <= float(self.acce_bound[2, 0]) ]
                 constraints += [ cp.abs(w) <= float(self.speed_bound[2, 0]) ]
+
+            if self.first_step_rate_limit:
+                # 首步相对上一拍执行指令限速 (见 __init__)。参数仿射, DPP 安全。
+                # u_0 = u_prev 恒满足它 (u_prev 本身在速度界内), 所以总可行。
+                up = self.para_u_prev
+                constraints += [ cp.norm(uv[:, 0:1] - up[0:2, :], axis=0)
+                                 <= float(self.first_step_bound[0, 0]) ]
+                if self.control_dim == 3:
+                    w = self.indep_u[2:3, :]
+                    constraints += [ cp.abs(w[:, 0:1] - up[2:3, :])
+                                     <= float(self.first_step_bound[2, 0]) ]
         else:
             constraints += [ cp.abs(self.indep_u[:, 1:] - self.indep_u[:, :-1] ) <= self.acce_bound ]
             constraints += [ cp.abs(self.indep_u) <= self.speed_bound]
@@ -394,11 +437,13 @@ class robot:
     
 
     def generate_state_parameter_value(self, nom_s, nom_u, qs_ref_s, pu_ref_us,
-                                       ref_tangent=None):
+                                       ref_tangent=None, u_prev=None):
 
         '''
         ref_tangent: 仅 omni/omni3 需要, 单位路径切向 (2, T), 不含 p_u。
                      顺序必须与 state_parameter_define 返回的列表一致。
+        u_prev: 仅 first_step_rate_limit 打开时需要, 上一拍执行的控制量
+                (control_dim, 1) tensor, 追加在列表末尾。
         '''
 
         state_value_list = [nom_s, qs_ref_s, pu_ref_us]
@@ -437,6 +482,11 @@ class robot:
         state_value_list += tensor_A_list
         state_value_list += tensor_B_list
         state_value_list += tensor_C_list
+
+        if self.first_step_rate_limit:
+            if u_prev is None:
+                raise ValueError("first_step_rate_limit requires u_prev")
+            state_value_list += [u_prev.reshape(self.control_dim, 1)]
 
         return state_value_list
 

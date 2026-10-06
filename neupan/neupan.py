@@ -79,6 +79,11 @@ class neupan(torch.nn.Module):
         # robot.indep_u 一致, 否则 generate_nom_ref_state 里的积分会形状不匹配。
         self.cur_vel_array = np.zeros((self.robot.control_dim, self.T))
 
+        # 上一次 forward **返回** (即被执行) 的控制量, 规划器控制坐标系。
+        # robot.first_step_rate_limit 打开且调用方没给 u_prev 时, 用它当 u_prev。
+        # arrive / stop 时 forward 返回零, 车执行的就是零, 所以这里也记零。
+        self._last_action = np.zeros((self.robot.control_dim, 1))
+
         self.ipath = InitialPath(
             receding, step_time, ref_speed, self.robot, **ipath_kwargs
         )
@@ -108,18 +113,33 @@ class neupan(torch.nn.Module):
         return cls(**config)
 
     @time_it("neupan forward")
-    def forward(self, state, points, velocities=None):
+    def forward(self, state, points, velocities=None, u_prev=None):
         """
         state: current state of the robot, matrix (3, 1), x, y, theta
         points: current input obstacle point positions, matrix (2, N), N is the number of obstacle points.
         velocities: current velocity of each obstacle point, matrix (2, N), N is the number of obstacle points. vx, vy
+        u_prev: control actually executed in the previous control cycle, (control_dim, 1), in the
+                planner's control frame (omni3: world-frame vx, vy, w). Only used when
+                robot.first_step_rate_limit is on; None -> the action this planner returned last
+                time (zeros initially and after reset()). Ignored when the limit is off.
         """
 
         assert state.shape[0] >= 3
 
         if self.ipath.check_arrive(state):
             self.info["arrive"] = True
-            return np.zeros((self.robot.control_dim, 1)), self.info
+            return self._executed(np.zeros((self.robot.control_dim, 1))), self.info
+
+        u_prev_tensor = None
+        if self.robot.first_step_rate_limit:
+            u_prev_np = self._last_action if u_prev is None else u_prev
+            u_prev_np = np.asarray(u_prev_np, dtype=float)
+            if u_prev_np.size != self.robot.control_dim:
+                raise ValueError(
+                    f"u_prev must have {self.robot.control_dim} elements, got shape "
+                    f"{u_prev_np.shape}")
+            u_prev_tensor = np_to_tensor(
+                u_prev_np.reshape(self.robot.control_dim, 1))
 
         nom_input_np = self.ipath.generate_nom_ref_state(
             state, self.cur_vel_array, self.ref_speed
@@ -141,7 +161,7 @@ class neupan(torch.nn.Module):
 
         opt_state_tensor, opt_vel_tensor, opt_distance_tensor = self.pan(
             *nom_input_tensor[:4], obstacle_points_tensor, point_velocities_tensor,
-            ref_tangent_tensor
+            ref_tangent_tensor, u_prev_tensor
         )
 
         opt_state_np, opt_vel_np = tensor_to_np(opt_state_tensor), tensor_to_np(
@@ -163,7 +183,7 @@ class neupan(torch.nn.Module):
 
         if self.check_stop():
             self.info["stop"] = True
-            return np.zeros((self.robot.control_dim, 1)), self.info
+            return self._executed(np.zeros((self.robot.control_dim, 1))), self.info
         else:
             self.info["stop"] = False
 
@@ -180,7 +200,13 @@ class neupan(torch.nn.Module):
                 # omni3 的角速度是规划器**算出来**的, 不是外挂补偿环给的。
                 self.info['omni_angular_speed'] = float(action[2, 0])
 
-        return action, self.info
+        return self._executed(action), self.info
+
+    def _executed(self, action):
+        # 记下这次返回的控制量: 它就是下一拍默认的 u_prev (见 forward)。
+        self._last_action = np.array(action, dtype=float).reshape(
+            self.robot.control_dim, 1)
+        return action
 
     def check_stop(self):
         return self.min_distance < self.collision_threshold
@@ -308,6 +334,7 @@ class neupan(torch.nn.Module):
         self.info["stop"] = False
         self.info["arrive"] = False
         self.cur_vel_array = np.zeros_like(self.cur_vel_array)
+        self._last_action = np.zeros_like(self._last_action)
 
     def set_initial_path(self, path):
 
